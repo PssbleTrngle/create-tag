@@ -1,4 +1,4 @@
-name: Create Tag
+name: PssbleTrngle/create-tag
 description: creates a git tag based on an input or a release.json file
 
 branding:

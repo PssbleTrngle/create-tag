@@ -1,0 +1,23 @@
+name: Create Tag
+description: creates a git tag based on an input or a release.json file
+
+branding:
+  icon: search
+  color: orange
+
+inputs:
+  token:
+    description: the github token
+    required: true
+  tag:
+    description: tag name
+  from:
+    description: release.json file
+
+outputs:
+  tag:
+    description: the created tag
+
+runs:
+  using: node24
+  main: dist/main.js

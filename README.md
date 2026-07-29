@@ -1,4 +1,4 @@
-# PssbleTrngle/find-release
+# PssbleTrngle/create-tag
 
 ```yaml
 - uses: PssbleTrngle/create-tag@v1

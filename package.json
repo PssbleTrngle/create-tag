@@ -1,5 +1,5 @@
 {
-  "name": "find-release",
+  "name": "create-tag",
   "module": "index.ts",
   "type": "module",
   "private": true,

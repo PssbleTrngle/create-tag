@@ -1967,6 +1967,7 @@ var require_dispatcher_base = __commonJS((exports, module) => {
     }
     get webSocketOptions() {
       return {
+        maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
         maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
       };
     }
@@ -5272,6 +5273,9 @@ var require_client_h1 = __commonJS((exports, module) => {
   var FastBuffer = Buffer[Symbol.species];
   var addListener = util.addListener;
   var removeAllListeners = util.removeAllListeners;
+  var kIdleSocketValidation = Symbol("kIdleSocketValidation");
+  var kIdleSocketValidationTimeout = Symbol("kIdleSocketValidationTimeout");
+  var kSocketUsed = Symbol("kSocketUsed");
   var extractBody;
   async function lazyllhttp() {
     const llhttpWasmData = process.env.JEST_WORKER_ID ? require_llhttp_wasm() : undefined;
@@ -5501,6 +5505,10 @@ var require_client_h1 = __commonJS((exports, module) => {
       if (socket.destroyed) {
         return -1;
       }
+      if (client[kRunning] === 0) {
+        util.destroy(socket, new SocketError("bad response", util.getSocketInfo(socket)));
+        return -1;
+      }
       const request = client[kQueue][client[kRunningIdx]];
       if (!request) {
         return -1;
@@ -5578,6 +5586,10 @@ var require_client_h1 = __commonJS((exports, module) => {
     onHeadersComplete(statusCode, upgrade, shouldKeepAlive) {
       const { client, socket, headers, statusText } = this;
       if (socket.destroyed) {
+        return -1;
+      }
+      if (client[kRunning] === 0) {
+        util.destroy(socket, new SocketError("bad response", util.getSocketInfo(socket)));
         return -1;
       }
       const request = client[kQueue][client[kRunningIdx]];
@@ -5701,6 +5713,7 @@ var require_client_h1 = __commonJS((exports, module) => {
       }
       request.onComplete(headers);
       client[kQueue][client[kRunningIdx]++] = null;
+      socket[kSocketUsed] = true;
       if (socket[kWriting]) {
         assert(client[kRunning] === 0);
         util.destroy(socket, new InformationalError("reset"));
@@ -5744,6 +5757,9 @@ var require_client_h1 = __commonJS((exports, module) => {
     socket[kWriting] = false;
     socket[kReset] = false;
     socket[kBlocking] = false;
+    socket[kIdleSocketValidation] = 0;
+    socket[kIdleSocketValidationTimeout] = null;
+    socket[kSocketUsed] = false;
     socket[kParser] = new Parser(client, socket, llhttpInstance);
     addListener(socket, "error", function(err) {
       assert(err.code !== "ERR_TLS_CERT_ALTNAME_INVALID");
@@ -5779,6 +5795,7 @@ var require_client_h1 = __commonJS((exports, module) => {
     addListener(socket, "close", function() {
       const client2 = this[kClient];
       const parser = this[kParser];
+      clearIdleSocketValidation(this);
       if (parser) {
         if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
           this[kError] = parser.finish() || this[kError];
@@ -5830,7 +5847,7 @@ var require_client_h1 = __commonJS((exports, module) => {
         return socket.destroyed;
       },
       busy(request) {
-        if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+        if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
           return true;
         }
         if (request) {
@@ -5848,6 +5865,24 @@ var require_client_h1 = __commonJS((exports, module) => {
       }
     };
   }
+  function clearIdleSocketValidation(socket) {
+    if (socket[kIdleSocketValidationTimeout]) {
+      clearTimeout(socket[kIdleSocketValidationTimeout]);
+      socket[kIdleSocketValidationTimeout] = null;
+    }
+    socket[kIdleSocketValidation] = 0;
+  }
+  function scheduleIdleSocketValidation(client, socket) {
+    socket[kIdleSocketValidation] = 1;
+    socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+      socket[kIdleSocketValidationTimeout] = null;
+      socket[kIdleSocketValidation] = 2;
+      if (client[kSocket] === socket && !socket.destroyed) {
+        client[kResume]();
+      }
+    }, 0);
+    socket[kIdleSocketValidationTimeout].unref?.();
+  }
   function resumeH1(client) {
     const socket = client[kSocket];
     if (socket && !socket.destroyed) {
@@ -5859,6 +5894,29 @@ var require_client_h1 = __commonJS((exports, module) => {
       } else if (socket[kNoRef] && socket.ref) {
         socket.ref();
         socket[kNoRef] = false;
+      }
+      if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+        if (socket[kIdleSocketValidation] === 0) {
+          scheduleIdleSocketValidation(client, socket);
+          socket[kParser].readMore();
+          if (socket.destroyed) {
+            return;
+          }
+          return;
+        }
+        if (socket[kIdleSocketValidation] === 1) {
+          socket[kParser].readMore();
+          if (socket.destroyed) {
+            return;
+          }
+          return;
+        }
+      }
+      if (client[kRunning] === 0) {
+        socket[kParser].readMore();
+        if (socket.destroyed) {
+          return;
+        }
       }
       if (client[kSize] === 0) {
         if (socket[kParser].timeoutType !== TIMEOUT_KEEP_ALIVE) {
@@ -5912,6 +5970,7 @@ var require_client_h1 = __commonJS((exports, module) => {
       process.emitWarning(new RequestContentLengthMismatchError);
     }
     const socket = client[kSocket];
+    clearIdleSocketValidation(socket);
     const abort = (err) => {
       if (request.aborted || request.completed) {
         return;
@@ -14999,18 +15058,14 @@ var require_parse = __commonJS((exports, module) => {
     } else if (attributeNameLowercase === "httponly") {
       cookieAttributeList.httpOnly = true;
     } else if (attributeNameLowercase === "samesite") {
-      let enforcement = "Default";
       const attributeValueLowercase = attributeValue.toLowerCase();
-      if (attributeValueLowercase.includes("none")) {
-        enforcement = "None";
+      if (attributeValueLowercase === "none") {
+        cookieAttributeList.sameSite = "None";
+      } else if (attributeValueLowercase === "strict") {
+        cookieAttributeList.sameSite = "Strict";
+      } else if (attributeValueLowercase === "lax") {
+        cookieAttributeList.sameSite = "Lax";
       }
-      if (attributeValueLowercase.includes("strict")) {
-        enforcement = "Strict";
-      }
-      if (attributeValueLowercase.includes("lax")) {
-        enforcement = "Lax";
-      }
-      cookieAttributeList.sameSite = enforcement;
     } else {
       cookieAttributeList.unparsed ??= [];
       cookieAttributeList.unparsed.push(`${attributeName}=${attributeValue}`);
@@ -15969,6 +16024,10 @@ var require_receiver = __commonJS((exports, module) => {
   var { closeWebSocketConnection } = require_connection();
   var { PerMessageDeflate } = require_permessage_deflate();
   var { MessageSizeExceededError } = require_errors();
+  function failWebsocketConnectionWithCode(ws, code, reason) {
+    closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason));
+    failWebsocketConnection(ws, reason);
+  }
 
   class ByteParser extends Writable {
     #buffers = [];
@@ -15979,11 +16038,13 @@ var require_receiver = __commonJS((exports, module) => {
     #info = {};
     #fragments = [];
     #extensions;
+    #maxFragments;
     #maxPayloadSize;
     constructor(ws, extensions, options = {}) {
       super();
       this.ws = ws;
       this.#extensions = extensions == null ? new Map : extensions;
+      this.#maxFragments = options.maxFragments ?? 0;
       this.#maxPayloadSize = options.maxPayloadSize ?? 0;
       if (this.#extensions.has("permessage-deflate")) {
         this.#extensions.set("permessage-deflate", new PerMessageDeflate(extensions, options));
@@ -15996,8 +16057,8 @@ var require_receiver = __commonJS((exports, module) => {
       this.run(callback);
     }
     #validatePayloadLength() {
-      if (this.#maxPayloadSize > 0 && !isControlFrame(this.#info.opcode) && this.#info.payloadLength > this.#maxPayloadSize) {
-        failWebsocketConnection(this.ws, "Payload size exceeds maximum allowed size");
+      if (this.#maxPayloadSize > 0 && !isControlFrame(this.#info.opcode) && this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize) {
+        failWebsocketConnectionWithCode(this.ws, 1009, "Payload size exceeds maximum allowed size");
         return false;
       }
       return true;
@@ -16108,9 +16169,11 @@ var require_receiver = __commonJS((exports, module) => {
             this.#state = parserStates.INFO;
           } else {
             if (!this.#info.compressed) {
-              this.writeFragments(body);
+              if (!this.writeFragments(body)) {
+                return;
+              }
               if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                failWebsocketConnection(this.ws, new MessageSizeExceededError().message);
+                failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message);
                 return;
               }
               if (!this.#info.fragmented && this.#info.fin) {
@@ -16120,12 +16183,15 @@ var require_receiver = __commonJS((exports, module) => {
             } else {
               this.#extensions.get("permessage-deflate").decompress(body, this.#info.fin, (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message);
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007;
+                  failWebsocketConnectionWithCode(this.ws, code, error.message);
                   return;
                 }
-                this.writeFragments(data);
+                if (!this.writeFragments(data)) {
+                  return;
+                }
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message);
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message);
                   return;
                 }
                 if (!this.#info.fin) {
@@ -16177,8 +16243,13 @@ var require_receiver = __commonJS((exports, module) => {
       return buffer;
     }
     writeFragments(fragment) {
+      if (this.#maxFragments > 0 && this.#fragments.length === this.#maxFragments) {
+        failWebsocketConnectionWithCode(this.ws, 1008, "Too many message fragments");
+        return false;
+      }
       this.#fragmentsBytes += fragment.length;
       this.#fragments.push(fragment);
+      return true;
     }
     consumeFragments() {
       const fragments = this.#fragments;
@@ -16580,8 +16651,11 @@ var require_websocket = __commonJS((exports, module) => {
     }
     #onConnectionEstablished(response, parsedExtensions) {
       this[kResponse] = response;
-      const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize;
+      const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions;
+      const maxFragments = webSocketOptions?.maxFragments;
+      const maxPayloadSize = webSocketOptions?.maxPayloadSize;
       const parser = new ByteParser(this, parsedExtensions, {
+        maxFragments,
         maxPayloadSize
       });
       parser.on("drain", onParserDrain);
@@ -19078,37 +19152,224 @@ var noiseValue = /^-?\d+n+$/;
 var originalStringify = JSON.stringify;
 var originalParse = JSON.parse;
 var customFormat = /^-?\d+n$/;
-var bigIntsStringify = /([\[:])?"(-?\d+)n"($|([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
-var noiseStringify = /([\[:])?("-?\d+n+)n("$|"([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
-var JSONStringify = (value, replacer, space) => {
-  if ("rawJSON" in JSON) {
-    return originalStringify(value, (key, value2) => {
-      if (typeof value2 === "bigint")
-        return JSON.rawJSON(value2.toString());
-      if (typeof replacer === "function")
-        return replacer(key, value2);
-      if (Array.isArray(replacer) && replacer.includes(key))
-        return value2;
-      return value2;
-    }, space);
+var bigIntsStringify = /([\[:])?"(-?\d+)n"($|\s*[,\}\]])/g;
+var noiseStringify = /([\[:])?("-?\d+n+)n("$|"\s*[,\}\]])/g;
+var isUnstringifiable = (val) => val === undefined || typeof val === "function" || typeof val === "symbol";
+var isRawJSON = (val) => val !== null && typeof val === "object" && val.constructor && val.constructor.name === "RawJSON";
+var stringifyIteratively = (rootValue, replacer, spaceParam) => {
+  let space = "";
+  if (typeof spaceParam === "number") {
+    space = " ".repeat(Math.min(10, Math.max(0, Math.floor(spaceParam))));
+  } else if (typeof spaceParam === "string") {
+    space = spaceParam.slice(0, 10);
   }
-  if (!value)
-    return originalStringify(value, replacer, space);
-  const convertedToCustomJSON = originalStringify(value, (key, value2) => {
-    const isNoise = typeof value2 === "string" && noiseValue.test(value2);
+  const isFunctionReplacer = typeof replacer === "function";
+  const propertyList = Array.isArray(replacer) ? new Set(replacer.map(String)) : null;
+  const prepareVal = (parent, key, val) => {
+    const isObject = val !== null && typeof val === "object";
+    const hasToJSON = isObject && typeof val.toJSON === "function";
+    if (hasToJSON) {
+      val = val.toJSON(key);
+    }
+    const isNoise = typeof val === "string" && noiseValue.test(val);
     if (isNoise)
-      return value2.toString() + "n";
-    if (typeof value2 === "bigint")
-      return value2.toString() + "n";
-    if (typeof replacer === "function")
-      return replacer(key, value2);
-    if (Array.isArray(replacer) && replacer.includes(key))
-      return value2;
-    return value2;
-  }, space);
-  const processedJSON = convertedToCustomJSON.replace(bigIntsStringify, "$1$2$3");
-  const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3");
-  return denoisedJSON;
+      return val + "n";
+    const isBigInt = typeof val === "bigint";
+    if (isBigInt) {
+      const supportsRawJSON = "rawJSON" in JSON;
+      if (supportsRawJSON)
+        return JSON.rawJSON(val.toString());
+      return val.toString() + "n";
+    }
+    if (isFunctionReplacer) {
+      val = replacer.call(parent, key, val);
+    }
+    const isPostReplacerObject = val !== null && typeof val === "object";
+    if (isPostReplacerObject) {
+      const isPrimitiveWrapper = val instanceof Number || val instanceof String || val instanceof Boolean;
+      if (isPrimitiveWrapper) {
+        val = val.valueOf();
+      }
+    }
+    return val;
+  };
+  const rootProcessed = prepareVal({ "": rootValue }, "", rootValue);
+  if (isUnstringifiable(rootProcessed)) {
+    return;
+  }
+  const isRootPrimitive = rootProcessed === null || typeof rootProcessed !== "object";
+  const isRootNativeRawJSON = isRawJSON(rootProcessed);
+  if (isRootPrimitive || isRootNativeRawJSON) {
+    return originalStringify(rootProcessed);
+  }
+  const chunks = [];
+  let level = 0;
+  const stack = [
+    {
+      parent: { "": rootProcessed },
+      key: "",
+      val: rootProcessed,
+      isArray: Array.isArray(rootProcessed),
+      keys: Array.isArray(rootProcessed) ? null : Object.keys(rootProcessed),
+      index: 0,
+      first: true
+    }
+  ];
+  const visited = new WeakSet([rootProcessed]);
+  while (stack.length > 0) {
+    const node = stack[stack.length - 1];
+    if (node.index === 0) {
+      chunks.push(node.isArray ? "[" : "{");
+      level++;
+    }
+    let isDone = false;
+    if (node.isArray) {
+      if (node.index < node.val.length) {
+        if (!node.first)
+          chunks.push(",");
+        if (space)
+          chunks.push(`
+` + space.repeat(level));
+        const childRaw = node.val[node.index];
+        const childVal = prepareVal(node.val, String(node.index), childRaw);
+        if (isUnstringifiable(childVal)) {
+          chunks.push("null");
+          node.first = false;
+          node.index++;
+        } else {
+          const isComplexObject = childVal !== null && typeof childVal === "object";
+          const isNativeRaw = isRawJSON(childVal);
+          if (isComplexObject && !isNativeRaw) {
+            if (visited.has(childVal)) {
+              throw new TypeError("Converting circular structure to JSON");
+            }
+            visited.add(childVal);
+            stack.push({
+              parent: node.val,
+              key: String(node.index),
+              val: childVal,
+              isArray: Array.isArray(childVal),
+              keys: Array.isArray(childVal) ? null : Object.keys(childVal),
+              index: 0,
+              first: true
+            });
+            node.first = false;
+            node.index++;
+          } else {
+            chunks.push(originalStringify(childVal));
+            node.first = false;
+            node.index++;
+          }
+        }
+      } else {
+        isDone = true;
+      }
+    } else {
+      while (node.index < node.keys.length) {
+        const k = node.keys[node.index++];
+        const isFilteredOutByArray = propertyList && !propertyList.has(k);
+        if (isFilteredOutByArray)
+          continue;
+        const childRaw = node.val[k];
+        const childVal = prepareVal(node.val, k, childRaw);
+        if (isUnstringifiable(childVal))
+          continue;
+        if (!node.first)
+          chunks.push(",");
+        if (space) {
+          chunks.push(`
+` + space.repeat(level) + originalStringify(k) + ": ");
+        } else {
+          chunks.push(originalStringify(k) + ":");
+        }
+        const isComplexObject = childVal !== null && typeof childVal === "object";
+        const isNativeRaw = isRawJSON(childVal);
+        if (isComplexObject && !isNativeRaw) {
+          if (visited.has(childVal)) {
+            throw new TypeError("Converting circular structure to JSON");
+          }
+          visited.add(childVal);
+          stack.push({
+            parent: node.val,
+            key: k,
+            val: childVal,
+            isArray: Array.isArray(childVal),
+            keys: Array.isArray(childVal) ? null : Object.keys(childVal),
+            index: 0,
+            first: true
+          });
+          node.first = false;
+          break;
+        } else {
+          chunks.push(originalStringify(childVal));
+          node.first = false;
+        }
+      }
+      const isNodeFullyProcessed = node.index >= node.keys.length && stack[stack.length - 1] === node;
+      if (isNodeFullyProcessed) {
+        isDone = true;
+      }
+    }
+    if (isDone) {
+      level--;
+      if (!node.first && space)
+        chunks.push(`
+` + space.repeat(level));
+      chunks.push(node.isArray ? "]" : "}");
+      visited.delete(node.val);
+      stack.pop();
+    }
+  }
+  return chunks.join("");
+};
+var JSONStringify = (value, replacer, space) => {
+  try {
+    const supportsRawJSON = "rawJSON" in JSON;
+    if (supportsRawJSON) {
+      return originalStringify(value, (key, val) => {
+        if (typeof val === "bigint")
+          return JSON.rawJSON(val.toString());
+        const hasFunctionReplacer = typeof replacer === "function";
+        if (hasFunctionReplacer)
+          return replacer(key, val);
+        const isKeyInArrayReplacer = Array.isArray(replacer) && replacer.includes(key);
+        if (isKeyInArrayReplacer)
+          return val;
+        return val;
+      }, space);
+    }
+    if (!value)
+      return originalStringify(value, replacer, space);
+    const convertedToCustomJSON = originalStringify(value, (key, val) => {
+      const isNoise = typeof val === "string" && noiseValue.test(val);
+      if (isNoise)
+        return val.toString() + "n";
+      if (typeof val === "bigint")
+        return val.toString() + "n";
+      const hasFunctionReplacer = typeof replacer === "function";
+      if (hasFunctionReplacer)
+        return replacer(key, val);
+      const isKeyInArrayReplacer = Array.isArray(replacer) && replacer.includes(key);
+      if (isKeyInArrayReplacer)
+        return val;
+      return val;
+    }, space);
+    const processedJSON = convertedToCustomJSON.replace(bigIntsStringify, "$1$2$3");
+    const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3");
+    return denoisedJSON;
+  } catch (error2) {
+    if (error2 instanceof RangeError) {
+      const convertedJSON = stringifyIteratively(value, replacer, space);
+      if (convertedJSON === undefined)
+        return;
+      const supportsRawJSON = "rawJSON" in JSON;
+      if (supportsRawJSON)
+        return convertedJSON;
+      const processedJSON = convertedJSON.replace(bigIntsStringify, "$1$2$3");
+      return processedJSON.replace(noiseStringify, "$1$2$3");
+    }
+    throw error2;
+  }
 };
 var featureCache = new Map;
 var isContextSourceSupported = () => {
@@ -19132,18 +19393,22 @@ var convertMarkedBigIntsReviver = (key, value, context, userReviver) => {
   const isNoiseValue = typeof value === "string" && noiseValue.test(value);
   if (isNoiseValue)
     return value.slice(0, -1);
-  if (typeof userReviver !== "function")
+  const hasUserReviver = typeof userReviver === "function";
+  if (!hasUserReviver)
     return value;
   return userReviver(key, value, context);
 };
 var JSONParseV2 = (text, reviver) => {
   return JSON.parse(text, (key, value, context) => {
-    const isBigNumber = typeof value === "number" && (value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER);
+    const isNumber = typeof value === "number";
+    const isOutOfBounds = value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER;
+    const isBigNumber = isNumber && isOutOfBounds;
     const isInt = context && intRegex.test(context.source);
     const isBigInt = isBigNumber && isInt;
     if (isBigInt)
       return BigInt(context.source);
-    if (typeof reviver !== "function")
+    const hasCustomReviver = typeof reviver === "function";
+    if (!hasCustomReviver)
       return value;
     return reviver(key, value, context);
   });
@@ -19152,23 +19417,79 @@ var MAX_INT = Number.MAX_SAFE_INTEGER.toString();
 var MAX_DIGITS = MAX_INT.length;
 var stringsOrLargeNumbers = /"(?:\\.|[^"])*"|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/g;
 var noiseValueWithQuotes = /^"-?\d+n+"$/;
+var applyReviverIteratively = (parsed, userReviver) => {
+  const rootHolder = { "": parsed };
+  const stack = [{ parent: rootHolder, key: "", visited: false }];
+  while (stack.length > 0) {
+    const node = stack[stack.length - 1];
+    if (!node.visited) {
+      node.visited = true;
+      const value = node.parent[node.key];
+      const isComplexObject = value !== null && typeof value === "object";
+      if (isComplexObject) {
+        const keys = Object.keys(value);
+        for (let i = keys.length - 1;i >= 0; i--) {
+          stack.push({ parent: value, key: keys[i], visited: false });
+        }
+      }
+    } else {
+      const { parent, key } = node;
+      let value = parent[key];
+      if (typeof value === "string") {
+        const isCustomFormatBigInt = customFormat.test(value);
+        if (isCustomFormatBigInt) {
+          value = BigInt(value.slice(0, -1));
+        } else {
+          const isNoise = noiseValue.test(value);
+          if (isNoise)
+            value = value.slice(0, -1);
+        }
+      }
+      const hasUserReviver = typeof userReviver === "function";
+      if (hasUserReviver) {
+        value = userReviver.call(parent, key, value);
+      }
+      const isDeleted = value === undefined;
+      if (isDeleted) {
+        delete parent[key];
+      } else {
+        parent[key] = value;
+      }
+      stack.pop();
+    }
+  }
+  return rootHolder[""];
+};
+var serializeBigInts = (text) => {
+  return text.replace(stringsOrLargeNumbers, (match, digits, fractional, exponential) => {
+    const isString = match[0] === '"';
+    const isNoise = isString && noiseValueWithQuotes.test(match);
+    if (isNoise)
+      return match.substring(0, match.length - 1) + 'n"';
+    const hasFractionalOrExponential = fractional || exponential;
+    const isLessThanMaxSafeInt = digits && (digits.length < MAX_DIGITS || digits.length === MAX_DIGITS && digits <= MAX_INT);
+    const isStandardValue = isString || hasFractionalOrExponential || isLessThanMaxSafeInt;
+    if (isStandardValue)
+      return match;
+    return '"' + match + 'n"';
+  });
+};
 var JSONParse = (text, reviver) => {
   if (!text)
     return originalParse(text, reviver);
-  if (isContextSourceSupported())
-    return JSONParseV2(text, reviver);
-  const serializedData = text.replace(stringsOrLargeNumbers, (text2, digits, fractional, exponential) => {
-    const isString = text2[0] === '"';
-    const isNoise = isString && noiseValueWithQuotes.test(text2);
-    if (isNoise)
-      return text2.substring(0, text2.length - 1) + 'n"';
-    const isFractionalOrExponential = fractional || exponential;
-    const isLessThanMaxSafeInt = digits && (digits.length < MAX_DIGITS || digits.length === MAX_DIGITS && digits <= MAX_INT);
-    if (isString || isFractionalOrExponential || isLessThanMaxSafeInt)
-      return text2;
-    return '"' + text2 + 'n"';
-  });
-  return originalParse(serializedData, (key, value, context) => convertMarkedBigIntsReviver(key, value, context, reviver));
+  try {
+    if (isContextSourceSupported())
+      return JSONParseV2(text, reviver);
+    const serializedData = serializeBigInts(text);
+    return originalParse(serializedData, (key, value, context) => convertMarkedBigIntsReviver(key, value, context, reviver));
+  } catch (error2) {
+    if (error2 instanceof RangeError) {
+      const serializedData = serializeBigInts(text);
+      const parsed = originalParse(serializedData);
+      return applyReviverIteratively(parsed, reviver);
+    }
+    throw error2;
+  }
 };
 
 // node_modules/@octokit/request-error/dist-src/index.js
@@ -19199,7 +19520,7 @@ class RequestError extends Error {
 }
 
 // node_modules/@octokit/request/dist-bundle/index.js
-var VERSION2 = "10.0.10";
+var VERSION2 = "10.0.11";
 var defaults_default = {
   headers: {
     "user-agent": `octokit-request.js/${VERSION2} ${getUserAgent()}`
@@ -19337,9 +19658,10 @@ function toErrorMessage(data) {
   if (data instanceof ArrayBuffer) {
     return "Unknown error";
   }
-  if ("message" in data) {
-    const suffix = "documentation_url" in data ? ` - ${data.documentation_url}` : "";
-    return Array.isArray(data.errors) ? `${data.message}: ${data.errors.map((v) => JSON.stringify(v)).join(", ")}${suffix}` : `${data.message}${suffix}`;
+  if (typeof data === "object" && data !== null && "message" in data) {
+    const objectData = data;
+    const suffix = "documentation_url" in objectData ? ` - ${objectData.documentation_url}` : "";
+    return Array.isArray(objectData.errors) ? `${objectData.message}: ${objectData.errors.map((v) => JSON.stringify(v)).join(", ")}${suffix}` : `${objectData.message}${suffix}`;
   }
   return `Unknown error: ${JSON.stringify(data)}`;
 }
